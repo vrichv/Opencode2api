@@ -9,15 +9,9 @@ function protocolError(message, statusCode = 502) {
 }
 
 function parseArguments(value, statusCode = 400) {
-  let parsed = value;
-  if (typeof value === 'string') {
-    try { parsed = JSON.parse(value); }
-    catch { throw protocolError('Tool arguments must contain complete valid JSON.', statusCode); }
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw protocolError('Tool arguments must be a JSON object.', statusCode);
-  }
-  return parsed;
+  if (typeof value !== 'string') return value === undefined ? {} : value;
+  try { return JSON.parse(value); }
+  catch { throw protocolError('Tool arguments must contain complete JSON.', statusCode); }
 }
 
 function encodeCall(call) {
@@ -64,7 +58,6 @@ function createToolAdapter(coreTools, definitions, choice, options = {}) {
       'The five native tool definitions are a transport interface, not tools to execute directly.',
       'To call any client tool, invoke the native shell function. Set its command to the prefix ' + JSON.stringify(CALL_PREFIX) + ' followed by a JSON object with exactly these fields: name (the client tool name), arguments (its original JSON input).',
       'Example transport arguments: ' + JSON.stringify({ command: CALL_PREFIX + JSON.stringify({ name: clients[0].function.name, arguments: {} }) }),
-      'Return only complete valid JSON. Preserve client argument names and values exactly. Do not add fields, wrap JSON in Markdown, or encode the arguments object as another JSON string.',
       'The gateway does not execute this command. It restores the original client tool call and routes it to the client. Do not use shell syntax or Markdown for the command.',
       'Do not call the native edit/glob/grep/read functions. A client tool with one of those names must also use the shell transport and its own original input schema.',
       'For parallel client calls, emit separate shell tool calls. Do not combine them in a command or a batch object.',
@@ -87,23 +80,64 @@ function createToolAdapter(coreTools, definitions, choice, options = {}) {
     return mapped;
   }
 
+  // Some models follow the native schema despite the transport instructions.
+  // Recover only an unambiguous declared client function with compatible input;
+  // never evaluate commands or invent tools/guess unsupported input mappings.
+  function nativeClientCall(nativeName, input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+    const candidates = clients.flatMap(tool => {
+      const name = tool.function.name;
+      if (name !== nativeName && !(nativeName === 'shell' && name === 'bash')) return [];
+      if (forcedName && name !== forcedName) return [];
+      const schema = tool.function.parameters;
+      if (!schema || schema.type !== 'object' || !schema.properties) return [];
+      const args = { ...input };
+      if (nativeName === 'shell' && name === 'bash') {
+        // DSH uses milliseconds too; do not map to clients whose timeout uses
+        // seconds or other semantics. No permission/approval fields are added.
+        if (schema.properties.timeoutMs && !schema.properties.timeout && Object.hasOwn(args, 'timeout')) {
+          args.timeoutMs = args.timeout;
+          delete args.timeout;
+        }
+        if (schema.properties.run_in_background && !schema.properties.background && Object.hasOwn(args, 'background')) {
+          args.run_in_background = args.background;
+          delete args.background;
+        }
+        if ((schema.required || []).includes('description') && schema.properties.description?.type === 'string' && !Object.hasOwn(args, 'description')) {
+          args.description = 'Run the requested shell command';
+        }
+      }
+      if ((schema.required || []).some(key => !Object.hasOwn(args, key))) return [];
+      // Unsupported native options must not silently disappear.
+      const compatible = Object.entries(args).every(([key, value]) => {
+        const property = schema.properties[key];
+        if (!property) return false;
+        if (property.enum && !property.enum.includes(value)) return false;
+        const type = Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value;
+        return !property.type || (Array.isArray(property.type) ? property.type : [property.type]).some(expected => expected === type || expected === 'integer' && Number.isInteger(value));
+      });
+      return compatible ? [{ name, arguments: args }] : [];
+    });
+    const exact = candidates.find(candidate => candidate.name === nativeName);
+    return exact || (candidates.length === 1 ? candidates[0] : null);
+  }
+
   function restoreToolCalls(calls) {
+    if (!clients.length) return [];
     if (disabled && calls.length) throw protocolError('Upstream invoked a tool while tool calling was disabled.');
     const result = calls.map(call => {
-      if (typeof call.id !== 'string' || !call.id) throw protocolError('Upstream client tool call is missing its id.');
       const wire = parseArguments(call.function?.arguments, 502);
-      if (call.function?.name !== 'shell' || typeof wire?.command !== 'string' || !wire.command.startsWith(CALL_PREFIX)) {
-        throw protocolError('Upstream did not return the declared client tool transport.');
+      let payload;
+      if (call.function?.name === 'shell' && typeof wire?.command === 'string' && wire.command.startsWith(CALL_PREFIX)) {
+        try { payload = JSON.parse(wire.command.slice(CALL_PREFIX.length)); }
+        catch { throw protocolError('Upstream returned incomplete client tool JSON.'); }
+      } else {
+        payload = nativeClientCall(call.function?.name, wire);
+        if (!payload) throw protocolError('Upstream tool call does not match the client transport or any compatible declared client tool.');
       }
-      const payload = parseArguments(wire.command.slice(CALL_PREFIX.length), 502);
-      if (Object.keys(payload).length !== 2 || !Object.hasOwn(payload, 'name') || !Object.hasOwn(payload, 'arguments')) {
-        throw protocolError('Client tool transport must contain exactly name and arguments.');
-      }
-      if (typeof payload.name !== 'string' || !clientToolNames.has(payload.name)) throw protocolError('Upstream requested an undeclared client tool.');
+      if (typeof payload?.name !== 'string' || !clientToolNames.has(payload.name)) throw protocolError('Upstream requested an undeclared client tool.');
       if (forcedName && payload.name !== forcedName) throw protocolError('Upstream did not honor the client selected tool.');
-      if (!payload.arguments || typeof payload.arguments !== 'object' || Array.isArray(payload.arguments)) {
-        throw protocolError('Client tool arguments must be an object, not another encoded string.');
-      }
+      if (!Object.hasOwn(payload, 'arguments')) throw protocolError('Upstream client tool call is missing arguments.');
       return {
         ...call,
         function: { name: payload.name, arguments: JSON.stringify(payload.arguments) }
@@ -124,8 +158,9 @@ function createToolAdapter(coreTools, definitions, choice, options = {}) {
       if (state.finished) return { delta, reason };
       state.finished = true;
       const rawCalls = [...state.calls.values()].map((call, index) => ({
+        ...call.extra,
         index,
-        id: call.id,
+        id: call.id || `call_o2p_${index}`,
         type: 'function',
         function: { name: call.name, arguments: call.arguments }
       }));
@@ -148,7 +183,7 @@ function createToolAdapter(coreTools, definitions, choice, options = {}) {
         if (Array.isArray(calls)) {
           for (const part of calls) {
             const index = part.index ?? 0;
-            if (!state.calls.has(index)) state.calls.set(index, { id: '', name: '', arguments: '' });
+            if (!state.calls.has(index)) state.calls.set(index, { id: '', name: '', arguments: '', extra: {} });
             const call = state.calls.get(index);
             if (typeof part.id === 'string') call.id += part.id;
             if (typeof part.function?.name === 'string') call.name += part.function.name;
