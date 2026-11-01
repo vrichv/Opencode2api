@@ -108,45 +108,11 @@ const GATE_READ_TOOL = {
 
 const CORE_TOOL_NAMES = new Set(['shell', 'edit', 'glob', 'grep', 'read']);
 
-/**
- * Merge client tools with OpenCode CLI gate requirements.
- * When client sends no tools (plain chat), attaches all 5 official CLI core tools
- * with tool_choice: "none" so upstream gate is satisfied while the model answers
- * in plain text without hallucinations.
- *
- * When client sends tools, preserves client definitions and appends missing core tools.
- * Tracks clientToolNames and injectedToolNames to prevent injected tool leakage (H2).
- */
-function mergeTools(clientTools, clientToolChoice) {
-  const hasUserTools = Array.isArray(clientTools) && clientTools.length > 0;
-  if (!hasUserTools) {
-    return {
-      tools: CORE_TOOLS,
-      toolChoice: "none",
-      clientToolNames: new Set(),
-      injectedToolNames: new Set(CORE_TOOL_NAMES)
-    };
-  }
+const { createToolAdapter } = require('./toolAdapter');
 
-  const clientToolNames = new Set(clientTools.map(t => t.function?.name || t.name).filter(Boolean));
-  // Client definitions ALWAYS take strict precedence over default core tools (H2)
-  const merged = [...clientTools];
-  const injectedToolNames = new Set();
-
-  for (const core of CORE_TOOLS) {
-    const coreName = core.function?.name || core.name;
-    if (!clientToolNames.has(coreName)) {
-      merged.push(core);
-      injectedToolNames.add(coreName);
-    }
-  }
-
-  return {
-    tools: merged,
-    toolChoice: clientToolChoice,
-    clientToolNames,
-    injectedToolNames
-  };
+// Keep the native definitions unchanged; transport client tools separately.
+function mergeTools(clientTools, clientToolChoice, options = {}) {
+  return createToolAdapter(CORE_TOOLS, clientTools, clientToolChoice, options);
 }
 
 module.exports = {

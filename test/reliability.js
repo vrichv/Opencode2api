@@ -535,6 +535,7 @@ async function main() {
 
   await test('manual prune removes only failed entries', async () => {
     await withConfig({
+      egress_mode: 'proxy_only',
       proxies: ['http://prune-a.example:8080', 'http://prune-b.example:8080'],
       proxy_auto_prune_dead: false
     }, () => {

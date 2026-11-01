@@ -23,13 +23,13 @@ const tools = require('../server/tools');
   };
   const resCustom = tools.mergeTools([clientEdit], 'auto');
   assert.strictEqual(resCustom.clientToolNames.has('edit'), true);
-  assert.strictEqual(resCustom.injectedToolNames.has('edit'), false);
-  assert.ok(resCustom.injectedToolNames.has('shell'));
-  const foundEdit = resCustom.tools.find(t => (t.function?.name || t.name) === 'edit');
-  assert.strictEqual(foundEdit.function.description, 'User custom edit tool', 'User tool must take precedence over core tool');
+  assert.deepStrictEqual(resCustom.tools, tools.CORE_TOOLS, 'All five native definitions must remain intact');
+  assert.strictEqual(resCustom.injectedToolNames.has('edit'), true);
+  const messages = resCustom.mapMessages([{ role: 'user', content: 'Use my edit tool' }]);
+  assert.ok(messages[0].content.includes(JSON.stringify(clientEdit)), 'Client schema must remain available to the model');
   console.log('  ✅ Plain chat attaches core tools with choice: "none"');
-  console.log('  ✅ Client definitions override core tools with identical names');
-  console.log('  ✅ Injected tools correctly tracked for downstream filtering');
+  console.log('  ✅ All five core tools remain intact; client tools retain their own definitions');
+  console.log('  ✅ Client tool transport is isolated from internal helpers');
 }
 
 // 2. Authentication Backdoors (C2)
@@ -138,7 +138,7 @@ console.log('\n[Test 4] Hardened Reliability Defaults (H3)');
 
   console.log('  ✅ Retry, deadline, queue, and egress defaults are bounded');
   console.log('  ✅ WARP configuration has been removed');
-  console.log('  ✅ Automatic proxy discovery defaults on; legacy scraper settings are removed');
+  console.log('  ✅ Automatic proxy discovery has an explicit default; legacy scraper settings are removed');
 }
 
 console.log('\n🎉 ALL SECURITY AUDIT REMEDIATION TESTS PASSED SUCCESSFULLY!\n');

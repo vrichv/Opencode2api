@@ -1,7 +1,7 @@
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
-const { StringDecoder } = require('string_decoder');
+const { createSseParser } = require('./sse');
 const config = require('./config');
 const identity = require('./identity');
 const tools = require('./tools');
@@ -218,6 +218,72 @@ function anthropicStopReason(openAiReason, hasToolCalls = false) {
   return 'end_turn';
 }
 
+// All client protocols use the same lossless tool/SSE decoder. Text and
+// reasoning pass immediately; only transport tool arguments wait for completion.
+function streamUpstreamEvents(upstreamRes, adapter, onChunk, onComplete, onError) {
+  const mapper = adapter.createResponseMapper();
+  let terminal = false;
+  const fail = error => {
+    if (terminal) return;
+    terminal = true;
+    onError(error);
+  };
+  const finish = () => {
+    if (terminal) return;
+    for (const chunk of mapper.end()) onChunk(chunk);
+    terminal = true;
+    try { onComplete(); }
+    catch (error) { onError(error); }
+  };
+  const consume = chunk => {
+    if (terminal) return;
+    const mapped = mapper.push(chunk);
+    if (mapped) onChunk(mapped);
+  };
+  const isJson = String(upstreamRes.headers['content-type'] || '').includes('application/json');
+  const jsonParts = [];
+  let jsonBytes = 0;
+  const parser = createSseParser(data => {
+    if (terminal || !data.trim()) return;
+    if (data.trim() === '[DONE]') finish();
+    else consume(JSON.parse(data));
+  });
+  upstreamRes.on('data', chunk => {
+    if (terminal) return;
+    try {
+      if (isJson) {
+        jsonBytes += chunk.length;
+        if (jsonBytes > 16 * 1024 * 1024) throw new Error('Upstream JSON response is too large.');
+        jsonParts.push(Buffer.from(chunk));
+      } else parser.write(chunk);
+    } catch (error) { fail(error); }
+  });
+  upstreamRes.on('end', () => {
+    if (terminal) return;
+    try {
+      if (isJson) {
+        const response = JSON.parse(Buffer.concat(jsonParts).toString('utf8'));
+        consume({ ...response, choices: response.choices?.map(choice => ({
+          ...choice,
+          delta: choice.delta || (choice.message ? {
+            ...choice.message,
+            ...(choice.message.tool_calls ? { tool_calls: choice.message.tool_calls.map((call, index) => ({ ...call, index })) } : {})
+          } : {})
+        })) });
+      } else parser.end();
+      finish();
+    } catch (error) { fail(error); }
+  });
+  upstreamRes.on('error', fail);
+  upstreamRes.on('aborted', () => fail(new Error('upstream aborted')));
+}
+
+function responseFailure(error, deadlineExceeded) {
+  if (deadlineExceeded) return { status: 504, type: 'upstream_timeout', message: 'Upstream request deadline exceeded.' };
+  if (error?.code === 'tool_adapter_error') return { status: 502, type: 'tool_adapter_error', message: error.message };
+  return { status: 502, type: 'upstream_stream_error', message: 'Upstream stream interrupted before completion.' };
+}
+
 const pausedUpstreams = new WeakSet();
 
 function writeStream(res, upstreamRes, chunk) {
@@ -333,8 +399,9 @@ function anthropicPayloadHasImages(payload) {
 function sanitizeClientPayload(payload) {
   const allowed = [
     'messages', 'model', 'stream', 'tools', 'tool_choice',
-    'temperature', 'top_p', 'max_tokens', 'presence_penalty',
-    'frequency_penalty', 'reasoning_effort', 'thinking', 'response_format'
+    'temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'presence_penalty',
+    'frequency_penalty', 'reasoning_effort', 'thinking', 'response_format',
+    'stream_options', 'parallel_tool_calls'
   ];
   const cleaned = {};
   for (const key of allowed) {
@@ -342,6 +409,10 @@ function sanitizeClientPayload(payload) {
       cleaned[key] = payload[key];
     }
   }
+  if (cleaned.max_tokens === undefined && cleaned.max_completion_tokens !== undefined) {
+    cleaned.max_tokens = cleaned.max_completion_tokens;
+  }
+  delete cleaned.max_completion_tokens;
   return cleaned;
 }
 
@@ -452,7 +523,8 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
   if (isRequestedFree && officialUpstream) {
     baseSanitized.messages = upstreamContext.ensureUpstreamEnv(baseSanitized.messages);
   }
-  const toolResult = tools.mergeTools(clientPayload.tools, clientPayload.tool_choice);
+  const toolResult = tools.mergeTools(clientPayload.tools, clientPayload.tool_choice, { parallelToolCalls: clientPayload.parallel_tool_calls });
+  baseSanitized.messages = toolResult.mapMessages(baseSanitized.messages);
   const mergedTools = toolResult.tools;
   const mergedToolChoice = toolResult.toolChoice;
   const clientToolNames = toolResult.clientToolNames;
@@ -737,19 +809,14 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
         if (res.flushHeaders) res.flushHeaders();
         if (res.socket?.setNoDelay) res.socket.setNoDelay(true);
 
-        const disarmWatchdog = attachStreamWatchdog(upstreamRes, failStream, 60000);
-
+        let disarmWatchdog = null;
         let promptTokens = 0;
         let completionTokens = 0;
         let totalTokens = 0;
         let reasoningTokens = 0;
         let streamedContentChars = 0;
         let streamedReasoningChars = 0;
-        let buffer = '';
-        const decoder = new StringDecoder('utf8');
         const estimatedPromptTokens = Math.ceil(Buffer.byteLength(payloadString) / 4);
-        // index -> 'client' | 'injected'; argument-only chunks carry no name.
-        const toolCallKinds = new Map();
         let streamFailed = false;
         const writeSse = (chunk) => writeStream(res, upstreamRes, chunk);
 
@@ -764,11 +831,7 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
           if (!deadlineExceeded && !res.destroyed && activeRoute.type === 'proxy') {
             egress.recordFailure(activeRoute, 'proxy_down');
           }
-          const status = deadlineExceeded ? 504 : 502;
-          const type = deadlineExceeded ? 'upstream_timeout' : 'upstream_stream_error';
-          const message = deadlineExceeded
-            ? 'Upstream request deadline exceeded.'
-            : 'Upstream stream interrupted before completion.';
+          const { status, type, message } = responseFailure(err, deadlineExceeded);
           console.warn(`[Proxy] Upstream stream interrupted for ${requestedModel} (${routeLabel(activeRoute)}): ${err?.message || 'unknown error'}`);
           if (!res.writableEnded && !res.destroyed) {
             try {
@@ -800,105 +863,32 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
             keyId: keyObj.id
           });
         };
-        upstreamRes.on('error', failStream);
-        upstreamRes.on('aborted', () => failStream(new Error('upstream aborted')));
 
-        upstreamRes.on('data', (chunk) => {
-          if (res.destroyed || res.writableEnded) {
-            try { upstreamRes.destroy(); } catch (e) {}
-            return;
+        disarmWatchdog = attachStreamWatchdog(upstreamRes, failStream, 60000);
+        streamUpstreamEvents(upstreamRes, toolResult, chunk => {
+          if (res.destroyed || res.writableEnded) return;
+          if (chunk.model === upstreamModel) chunk = { ...chunk, model: requestedModel };
+          if (chunk.usage) {
+            promptTokens = chunk.usage.prompt_tokens || promptTokens;
+            completionTokens = chunk.usage.completion_tokens || completionTokens;
+            totalTokens = chunk.usage.total_tokens || totalTokens;
+            reasoningTokens = chunk.usage.completion_tokens_details?.reasoning_tokens || reasoningTokens;
           }
-          let chunkStr = decoder.write(chunk);
-          // Ensure model ID in chunks reflects the requested or resolved ID
-          if (upstreamModel && resolvedModel && upstreamModel !== resolvedModel) {
-            chunkStr = chunkStr.replaceAll(upstreamModel, requestedModel);
+          for (const choice of chunk.choices || []) {
+            const delta = choice.delta;
+            if (typeof delta?.content === 'string') streamedContentChars += delta.content.length;
+            if (typeof delta?.reasoning_content === 'string') streamedReasoningChars += delta.reasoning_content.length;
           }
-
-          buffer += chunkStr;
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) {
-              if (line) writeSse(line + '\n');
-              continue;
-            }
-            const dataStr = trimmed.slice(5).trim();
-            if (dataStr === '[DONE]') {
-              writeSse('data: [DONE]\n\n');
-              if (res.flush) res.flush();
-              continue;
-            }
-            try {
-              const p = JSON.parse(dataStr);
-              if (p.usage) {
-                promptTokens = p.usage.prompt_tokens || promptTokens;
-                completionTokens = p.usage.completion_tokens || completionTokens;
-                totalTokens = p.usage.total_tokens || totalTokens;
-                reasoningTokens = p.usage.completion_tokens_details?.reasoning_tokens || reasoningTokens;
-              }
-              if (Array.isArray(p.choices)) {
-                for (const choice of p.choices) {
-                  const delta = choice?.delta;
-                  if (!delta) continue;
-                  if (typeof delta.content === 'string') streamedContentChars += delta.content.length;
-                  if (typeof delta.reasoning_content === 'string') streamedReasoningChars += delta.reasoning_content.length;
-                }
-              }
-
-              // Filter out injected tool calls from client stream (H2).
-              // Tool argument chunks do not repeat the function name, so track
-              // each streamed tool-call index once its name is known.
-              if (p.choices && Array.isArray(p.choices)) {
-                let skipChunk = false;
-                for (const choice of p.choices) {
-                  if (choice.delta?.tool_calls && Array.isArray(choice.delta.tool_calls)) {
-                    const kept = [];
-                    for (const tc of choice.delta.tool_calls) {
-                      const idx = Number.isInteger(tc.index) ? tc.index : 0;
-                      const name = tc.function?.name;
-                      if (name) {
-                        const isClient = !!(clientToolNames && clientToolNames.has(name));
-                        toolCallKinds.set(idx, isClient ? 'client' : 'injected');
-                      }
-                      const kind = toolCallKinds.get(idx);
-                      if (kind === 'client') {
-                        kept.push(tc);
-                      }
-                    }
-                    if (kept.length > 0) {
-                      choice.delta.tool_calls = kept;
-                    } else {
-                      delete choice.delta.tool_calls;
-                      if (choice.finish_reason === 'tool_calls') {
-                        choice.finish_reason = 'stop';
-                      }
-                      if (!choice.delta.content && !choice.delta.reasoning_content && !choice.finish_reason) {
-                        skipChunk = true;
-                      }
-                    }
-                  }
-                }
-                if (skipChunk && !p.choices.some(c => c.delta?.content || c.finish_reason)) {
-                  continue;
-                }
-              }
-
-              writeSse(`data: ${JSON.stringify(p)}\n\n`);
-              if (res.flush) res.flush();
-            } catch (e) {
-              writeSse(line + '\n');
-              if (res.flush) res.flush();
-            }
-          }
-        });
-
-        upstreamRes.on('end', () => {
+          writeSse(`data: ${JSON.stringify(chunk)}\n\n`);
+          if (res.flush) res.flush();
+        }, () => {
           if (streamFailed) return;
+          disarmWatchdog();
           releaseSlot();
-          if (!res.writableEnded && !res.destroyed) res.end();
-          const latency = Date.now() - startTime;
+          if (!res.writableEnded && !res.destroyed) {
+            writeSse('data: [DONE]\n\n');
+            res.end();
+          }
           const pTokens = promptTokens || estimatedPromptTokens;
           const cTokens = completionTokens || Math.ceil((streamedContentChars + streamedReasoningChars) / 4);
           const total = totalTokens || (pTokens + cTokens);
@@ -906,17 +896,13 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
           upstreamQuota.clear(currentModel);
           upstreamQuota.clear(requestedModel);
           metrics.recordRequest({
-            model: requestedModel,
-            status: 200,
+            model: requestedModel, status: 200,
             tokens: { prompt_tokens: pTokens, completion_tokens: cTokens, total_tokens: total, reasoning_tokens: reasoningTokens },
-            latencyMs: latency,
-            stream: true,
-            keyId: keyObj.id
+            latencyMs: Date.now() - startTime, stream: true, keyId: keyObj.id
           });
-        });
+        }, failStream);
       } else {
         // 2. Non-streaming aggregation mode
-        let buffer = '';
         let accumulatedContent = '';
         let accumulatedReasoning = '';
         let accumulatedToolCalls = [];
@@ -924,18 +910,13 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
         let completionId = 'chatcmpl-' + crypto.randomUUID();
         let finished = false;
         let upstreamFinishReason = null;
-        const decoder = new StringDecoder('utf8');
         const estimatedPromptTokens = Math.ceil(Buffer.byteLength(payloadString) / 4);
 
         function failAggregate(err) {
           if (finished) return;
           finished = true;
           releaseSlot();
-          const status = deadlineExceeded ? 504 : 502;
-          const type = deadlineExceeded ? 'upstream_timeout' : 'upstream_stream_error';
-          const message = deadlineExceeded
-            ? 'Upstream request deadline exceeded.'
-            : 'Upstream stream interrupted before completion.';
+          const { status, type, message } = responseFailure(err, deadlineExceeded);
           console.warn(`[Proxy] Upstream stream interrupted for ${requestedModel} (${routeLabel(activeRoute)}): ${err?.message || 'unknown error'}`);
 
           const pTokens = finalUsage?.prompt_tokens || estimatedPromptTokens;
@@ -957,8 +938,6 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
           res.writeHead(status, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message, type, code: status } }));
         }
-        upstreamRes.on('error', failAggregate);
-        upstreamRes.on('aborted', () => failAggregate(new Error('upstream aborted')));
 
         function finishResponse() {
           if (finished) return;
@@ -1022,51 +1001,18 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
           }
         }
 
-        upstreamRes.on('data', (chunk) => {
-          if (res.destroyed || res.writableEnded) {
-            try { upstreamRes.destroy(); } catch (e) {}
-            return;
+        streamUpstreamEvents(upstreamRes, toolResult, parsed => {
+          if (parsed.id) completionId = parsed.id;
+          if (parsed.usage) finalUsage = parsed.usage;
+          if (parsed.choices?.[0]?.finish_reason) upstreamFinishReason = parsed.choices[0].finish_reason;
+          const delta = parsed.choices?.[0]?.delta;
+          if (!delta) return;
+          if (delta.reasoning_content) accumulatedReasoning += delta.reasoning_content;
+          if (delta.content) accumulatedContent += delta.content;
+          for (const call of delta.tool_calls || []) {
+            accumulatedToolCalls[call.index || 0] = { ...call };
           }
-          buffer += decoder.write(chunk);
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const dataStr = trimmed.slice(5).trim();
-            if (dataStr === '[DONE]') {
-              finishResponse();
-              try { upstreamReq.destroy(); } catch (e) {}
-              return;
-            }
-
-            try {
-              const parsed = JSON.parse(dataStr);
-              if (parsed.id) completionId = parsed.id;
-              if (parsed.usage) finalUsage = parsed.usage;
-              if (parsed.choices?.[0]?.finish_reason) upstreamFinishReason = parsed.choices[0].finish_reason;
-
-              const delta = parsed.choices?.[0]?.delta;
-              if (delta) {
-                if (delta.reasoning_content) accumulatedReasoning += delta.reasoning_content;
-                if (delta.content) accumulatedContent += delta.content;
-                if (delta.tool_calls) {
-                  for (const tc of delta.tool_calls) {
-                    const idx = tc.index || 0;
-                    if (!accumulatedToolCalls[idx]) {
-                      accumulatedToolCalls[idx] = { id: tc.id || 'call_' + idx, type: 'function', function: { name: '', arguments: '' } };
-                    }
-                    if (tc.function?.name) accumulatedToolCalls[idx].function.name += tc.function.name;
-                    if (tc.function?.arguments) accumulatedToolCalls[idx].function.arguments += tc.function.arguments;
-                  }
-                }
-              }
-            } catch (e) {}
-          }
-        });
-
-        upstreamRes.on('end', () => finishResponse());
+        }, finishResponse, failAggregate);
       }
       return; // Request handled successfully!
     }
@@ -1336,14 +1282,17 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
 
   let clientToolChoice = undefined;
   if (clientPayload.tool_choice) {
-    if (clientPayload.tool_choice.type === 'auto') clientToolChoice = 'auto';
+    if (clientPayload.tool_choice.type === 'none') clientToolChoice = 'none';
+    else if (clientPayload.tool_choice.type === 'auto') clientToolChoice = 'auto';
     else if (clientPayload.tool_choice.type === 'any') clientToolChoice = 'required';
     else if (clientPayload.tool_choice.type === 'tool' && clientPayload.tool_choice.name) {
       clientToolChoice = { type: 'function', function: { name: clientPayload.tool_choice.name } };
     }
   }
 
-  const toolResult = tools.mergeTools(clientTools, clientToolChoice);
+  const parallelToolCalls = clientPayload.tool_choice?.disable_parallel_tool_use === true ? false : undefined;
+  const toolResult = tools.mergeTools(clientTools, clientToolChoice, { parallelToolCalls });
+  openAiMessages = toolResult.mapMessages(openAiMessages);
   const mergedTools = toolResult.tools;
   const mergedToolChoice = toolResult.toolChoice;
   const clientToolNames = toolResult.clientToolNames;
@@ -1540,6 +1489,7 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
       stream: true,
       tools: mergedTools,
       ...(mergedToolChoice !== undefined ? { tool_choice: mergedToolChoice } : {}),
+      ...(parallelToolCalls !== undefined ? { parallel_tool_calls: parallelToolCalls } : {}),
       ...(clientPayload.temperature !== undefined ? { temperature: clientPayload.temperature } : {}),
       ...(clientPayload.top_p !== undefined ? { top_p: clientPayload.top_p } : {}),
       ...(clientPayload.max_tokens ? { max_tokens: clientPayload.max_tokens } : {})
@@ -1682,7 +1632,7 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
       }
 
       if (isClientStream) {
-        // Stream Anthropic SSE with zero buffering & extended thinking / tool call support
+        // Stream text/reasoning immediately; restore complete client tool calls.
         const estimatedPromptTokens = Math.ceil(Buffer.byteLength(payloadString) / 4);
         const writeSse = (chunk) => writeStream(res, upstreamRes, chunk);
         res.writeHead(200, {
@@ -1694,7 +1644,7 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
         if (res.flushHeaders) res.flushHeaders();
         if (res.socket?.setNoDelay) res.socket.setNoDelay(true);
 
-        const disarmWatchdog = attachStreamWatchdog(upstreamRes, failStream, 60000);
+        let disarmWatchdog = null;
 
         // Send initial message_start
         writeSse(`event: message_start\ndata: ${JSON.stringify({
@@ -1711,20 +1661,16 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
           }
         })}\n\n`);
 
-        let buffer = '';
         let promptTokens = 0;
         let completionTokens = 0;
         let reasoningTokens = 0;
         let streamedContentChars = 0;
         let streamedReasoningChars = 0;
-        const decoder = new StringDecoder('utf8');
         let activeBlockIndex = -1;
         let activeBlockType = null;
         let activeToolIndex = null;
         let hasToolCalls = false;
         let upstreamFinishReason = null;
-        // index -> 'client' | 'injected'; argument-only chunks carry no name.
-        const toolCallKinds = new Map();
         let streamFailed = false;
 
         const failStream = (err) => {
@@ -1738,17 +1684,14 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
           if (!deadlineExceeded && !res.destroyed && activeRoute.type === 'proxy') {
             egress.recordFailure(activeRoute, 'proxy_down');
           }
-          const status = deadlineExceeded ? 504 : 502;
-          const message = deadlineExceeded
-            ? 'Upstream request deadline exceeded.'
-            : 'Upstream stream interrupted before completion.';
+          const { status, type, message } = responseFailure(err, deadlineExceeded);
           console.warn(`[Proxy] Upstream Anthropic stream interrupted for ${requestedModel} (${routeLabel(activeRoute)}): ${err?.message || 'unknown error'}`);
           if (!res.writableEnded && !res.destroyed) {
             try {
               writeSse(`event: error\ndata: ${JSON.stringify({
                 type: 'error',
                 error: {
-                  type: 'api_error',
+                  type: type === 'tool_adapter_error' ? type : 'api_error',
                   message
                 }
               })}\n\n`);
@@ -1778,8 +1721,8 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
             keyId: keyObj.id
           });
         };
-        upstreamRes.on('error', failStream);
-        upstreamRes.on('aborted', () => failStream(new Error('upstream aborted')));
+
+        disarmWatchdog = attachStreamWatchdog(upstreamRes, failStream, 60000);
 
         function closeCurrentBlock() {
           if (activeBlockIndex >= 0 && activeBlockType !== null) {
@@ -1843,82 +1786,43 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
           }
         }
 
-        upstreamRes.on('data', (chunk) => {
-          if (res.destroyed || res.writableEnded) {
-            try { upstreamRes.destroy(); } catch (e) {}
-            return;
+        streamUpstreamEvents(upstreamRes, toolResult, parsed => {
+          if (res.destroyed || res.writableEnded) return;
+          if (parsed.usage) {
+            promptTokens = parsed.usage.prompt_tokens || promptTokens;
+            completionTokens = parsed.usage.completion_tokens || completionTokens;
+            reasoningTokens = parsed.usage.completion_tokens_details?.reasoning_tokens || reasoningTokens;
           }
-          buffer += decoder.write(chunk);
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const dataStr = trimmed.slice(5).trim();
-            if (dataStr === '[DONE]') continue;
-
-            try {
-              const parsed = JSON.parse(dataStr);
-              if (parsed.usage) {
-                promptTokens = parsed.usage.prompt_tokens || promptTokens;
-                completionTokens = parsed.usage.completion_tokens || completionTokens;
-                reasoningTokens = parsed.usage.completion_tokens_details?.reasoning_tokens || reasoningTokens;
-              }
-              if (parsed.choices?.[0]?.finish_reason) upstreamFinishReason = parsed.choices[0].finish_reason;
-              const delta = parsed.choices?.[0]?.delta;
-              if (delta) {
-                if (typeof delta.reasoning_content === 'string') streamedReasoningChars += delta.reasoning_content.length;
-                if (typeof delta.content === 'string') streamedContentChars += delta.content.length;
-                if (delta.reasoning_content) {
-                  ensureThinkingBlock();
-                  writeSse(`event: content_block_delta\ndata: ${JSON.stringify({
-                    type: 'content_block_delta',
-                    index: activeBlockIndex,
-                    delta: { type: 'thinking_delta', thinking: delta.reasoning_content }
-                  })}\n\n`);
-                  if (res.flush) res.flush();
-                }
-
-                if (delta.content) {
-                  ensureTextBlock();
-                  writeSse(`event: content_block_delta\ndata: ${JSON.stringify({
-                    type: 'content_block_delta',
-                    index: activeBlockIndex,
-                    delta: { type: 'text_delta', text: delta.content }
-                  })}\n\n`);
-                  if (res.flush) res.flush();
-                }
-
-                if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                  for (const tc of delta.tool_calls) {
-                    const tIndex = tc.index !== undefined ? tc.index : 0;
-                    const name = tc.function?.name;
-                    if (name) {
-                      const isClient = !!(clientToolNames && clientToolNames.has(name));
-                      toolCallKinds.set(tIndex, isClient ? 'client' : 'injected');
-                    }
-                    if (toolCallKinds.get(tIndex) !== 'client') continue;
-                    if (name) {
-                      ensureToolBlock(tIndex, tc.id, name);
-                    }
-                    if (tc.function?.arguments && activeBlockType === 'tool_use' && activeToolIndex === tIndex) {
-                      writeSse(`event: content_block_delta\ndata: ${JSON.stringify({
-                        type: 'content_block_delta',
-                        index: activeBlockIndex,
-                        delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
-                      })}\n\n`);
-                      if (res.flush) res.flush();
-                    }
-                  }
-                }
-              }
-            } catch (e) {}
+          if (parsed.choices?.[0]?.finish_reason) upstreamFinishReason = parsed.choices[0].finish_reason;
+          const delta = parsed.choices?.[0]?.delta;
+          if (!delta) return;
+          if (delta.reasoning_content) {
+            streamedReasoningChars += delta.reasoning_content.length;
+            ensureThinkingBlock();
+            writeSse(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta', index: activeBlockIndex,
+              delta: { type: 'thinking_delta', thinking: delta.reasoning_content }
+            })}\n\n`);
           }
-        });
-
-        upstreamRes.on('end', () => {
+          if (delta.content) {
+            streamedContentChars += delta.content.length;
+            ensureTextBlock();
+            writeSse(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta', index: activeBlockIndex,
+              delta: { type: 'text_delta', text: delta.content }
+            })}\n\n`);
+          }
+          for (const call of delta.tool_calls || []) {
+            ensureToolBlock(call.index ?? 0, call.id, call.function.name);
+            writeSse(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta', index: activeBlockIndex,
+              delta: { type: 'input_json_delta', partial_json: call.function.arguments }
+            })}\n\n`);
+          }
+          if (res.flush) res.flush();
+        }, () => {
           if (streamFailed) return;
+          disarmWatchdog();
           releaseSlot();
           if (res.destroyed || res.writableEnded) return;
           closeCurrentBlock();
@@ -1958,27 +1862,22 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
             stream: true,
             keyId: keyObj.id
           });
-        });
+        }, failStream);
       } else {
         // Non-streaming Anthropic aggregation
-        let buffer = '';
         let accumulatedContent = '';
         let accumulatedReasoning = '';
         let accumulatedToolCalls = [];
         let finalUsage = null;
         let finished = false;
         let upstreamFinishReason = null;
-        const decoder = new StringDecoder('utf8');
         const estimatedPromptTokens = Math.ceil(Buffer.byteLength(payloadString) / 4);
 
         function failAggregate(err) {
           if (finished) return;
           finished = true;
           releaseSlot();
-          const status = deadlineExceeded ? 504 : 502;
-          const message = deadlineExceeded
-            ? 'Upstream request deadline exceeded.'
-            : 'Upstream stream interrupted before completion.';
+          const { status, type, message } = responseFailure(err, deadlineExceeded);
           console.warn(`[Proxy] Upstream Anthropic stream interrupted for ${requestedModel} (${routeLabel(activeRoute)}): ${err?.message || 'unknown error'}`);
 
           const pTokens = finalUsage?.prompt_tokens || estimatedPromptTokens;
@@ -1998,10 +1897,8 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
             return;
           }
           res.writeHead(status, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: type === 'tool_adapter_error' ? type : 'api_error', message } }));
         }
-        upstreamRes.on('error', failAggregate);
-        upstreamRes.on('aborted', () => failAggregate(new Error('upstream aborted')));
 
         function finishAnthropic() {
           if (finished) return;
@@ -2075,49 +1972,17 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
           }
         }
 
-        upstreamRes.on('data', (chunk) => {
-          if (res.destroyed || res.writableEnded) {
-            try { upstreamRes.destroy(); } catch (e) {}
-            return;
+        streamUpstreamEvents(upstreamRes, toolResult, parsed => {
+          if (parsed.usage) finalUsage = parsed.usage;
+          if (parsed.choices?.[0]?.finish_reason) upstreamFinishReason = parsed.choices[0].finish_reason;
+          const delta = parsed.choices?.[0]?.delta;
+          if (!delta) return;
+          if (delta.reasoning_content) accumulatedReasoning += delta.reasoning_content;
+          if (delta.content) accumulatedContent += delta.content;
+          for (const call of delta.tool_calls || []) {
+            accumulatedToolCalls[call.index || 0] = { ...call };
           }
-          buffer += decoder.write(chunk);
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const dataStr = trimmed.slice(5).trim();
-            if (dataStr === '[DONE]') {
-              finishAnthropic();
-              try { upstreamReq.destroy(); } catch (e) {}
-              return;
-            }
-
-            try {
-              const parsed = JSON.parse(dataStr);
-              if (parsed.usage) finalUsage = parsed.usage;
-              if (parsed.choices?.[0]?.finish_reason) upstreamFinishReason = parsed.choices[0].finish_reason;
-              const delta = parsed.choices?.[0]?.delta;
-              if (delta) {
-                if (delta.reasoning_content) accumulatedReasoning += delta.reasoning_content;
-                if (delta.content) accumulatedContent += delta.content;
-                if (delta.tool_calls) {
-                  for (const tc of delta.tool_calls) {
-                    const idx = tc.index || 0;
-                    if (!accumulatedToolCalls[idx]) {
-                      accumulatedToolCalls[idx] = { id: tc.id || 'call_' + idx, type: 'function', function: { name: '', arguments: '' } };
-                    }
-                    if (tc.function?.name) accumulatedToolCalls[idx].function.name += tc.function.name;
-                    if (tc.function?.arguments) accumulatedToolCalls[idx].function.arguments += tc.function.arguments;
-                  }
-                }
-              }
-            } catch (e) {}
-          }
-        });
-
-        upstreamRes.on('end', () => finishAnthropic());
+        }, finishAnthropic, failAggregate);
       }
       return;
     }

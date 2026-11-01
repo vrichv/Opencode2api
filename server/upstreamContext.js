@@ -38,7 +38,7 @@ function isGitRepo(dir) {
 }
 
 function buildEnvBlock(options = {}) {
-  const cwd = path.resolve(options.cwd || process.cwd());
+  const cwd = options.cwd || path.resolve(process.cwd());
   // The CLI reports the host platform name, not the Node arch.
   const platform = options.platform || process.platform;
   const gitRepo = options.gitRepo === undefined ? isGitRepo(cwd) : !!options.gitRepo;

@@ -85,7 +85,7 @@ const DEFAULT_CONFIG = {
   port: parseInt(process.env.PORT, 10) || 8080,
   admin_username: process.env.DASHBOARD_USER || 'admin',
   admin_password: process.env.DASHBOARD_PASS || '',
-  client_version: '2.1.4',
+  client_version: '2.2.5',
   // Node's TLS fingerprint is rejected by the official inference gate. The
   // bridge runs the OpenCode CLI's embedded Bun runtime on loopback so free
   // tier requests use the accepted fingerprint.
@@ -95,7 +95,9 @@ const DEFAULT_CONFIG = {
   bun_bridge_ready_wait_ms: parseInt(process.env.BUN_BRIDGE_READY_WAIT_MS, 10) || 12000,
   discovery_interval_seconds: 600,
   auto_update_cli: true,
-  free_only: true,
+  free_only: process.env.FREE_ONLY !== undefined
+    ? !/^(false|0|no|off)$/i.test(String(process.env.FREE_ONLY).trim())
+    : true,
   global_rpm_limit: 0, // 0 = unlimited
   global_tpm_limit: 0, // 0 = unlimited
   smart_fallback: process.env.SMART_FALLBACK === 'true',
@@ -103,7 +105,9 @@ const DEFAULT_CONFIG = {
   proxy_quota_failovers: parseInt(process.env.PROXY_QUOTA_FAILOVERS, 10) || 20,
   proxy_check_interval_minutes: parseInt(process.env.PROXY_CHECK_INTERVAL_MINUTES, 10) || 30,
   proxy_auto_prune_dead: process.env.PROXY_AUTO_PRUNE_DEAD !== 'false',
-  auto_proxy_discovery: process.env.AUTO_PROXY_DISCOVERY !== 'false',
+  auto_proxy_discovery: process.env.AUTO_PROXY_DISCOVERY !== undefined
+    ? !/^(false|0|no|off)$/i.test(String(process.env.AUTO_PROXY_DISCOVERY).trim())
+    : false,
   auto_proxy_target: parseInt(process.env.AUTO_PROXY_TARGET, 10) || 100,
   max_auto_pool: parseInt(process.env.MAX_AUTO_POOL, 10) || 100,
   max_proxy_pool: parseInt(process.env.MAX_PROXY_POOL, 10) || 150,
@@ -115,11 +119,15 @@ const DEFAULT_CONFIG = {
   queue_wait_ms: parseInt(process.env.QUEUE_WAIT_MS, 10) || 15000,
   upstream_zen_key: process.env.OPENCODE_ZEN_KEY || '',
   proxies: process.env.PROXIES ? process.env.PROXIES.split(',').map(s => s.trim()).filter(Boolean) : [],
-  rotating_proxy_enabled: process.env.ROTATING_PROXY_ENABLED === 'true' || false,
+  rotating_proxy_enabled: process.env.ROTATING_PROXY_ENABLED !== undefined
+    ? !/^(false|0|no|off)$/i.test(String(process.env.ROTATING_PROXY_ENABLED).trim())
+    : false,
   rotating_proxy_url: process.env.ROTATING_PROXY_URL || '',
   rotating_proxy_session_mode: process.env.ROTATING_PROXY_SESSION_MODE || 'auto',
-  egress_mode: process.env.EGRESS_MODE || 'auto',
-  allow_direct_fallback: process.env.ALLOW_DIRECT_FALLBACK !== 'false',
+  egress_mode: process.env.EGRESS_MODE || 'direct',
+  allow_direct_fallback: process.env.ALLOW_DIRECT_FALLBACK !== undefined
+    ? !/^(false|0|no|off)$/i.test(String(process.env.ALLOW_DIRECT_FALLBACK).trim())
+    : false,
   upstream_models_url: 'https://opencode.ai/zen/v1/models',
   upstream_metadata_url: 'https://models.opencode.ai/api.json',
   upstream_inference_url: process.env.UPSTREAM_INFERENCE_URL || DEFAULT_UPSTREAM_INFERENCE_URL
@@ -229,8 +237,10 @@ class ConfigManager {
       }
       if (process.env.ROTATING_PROXY_ENABLED !== undefined) {
         this.config.rotating_proxy_enabled = !/^(false|0|no|off)$/i.test(String(process.env.ROTATING_PROXY_ENABLED).trim());
+      } else if (fileConfig.rotating_proxy_enabled !== undefined) {
+        this.config.rotating_proxy_enabled = !/^(false|0|no|off)$/i.test(String(fileConfig.rotating_proxy_enabled).trim());
       } else {
-        this.config.rotating_proxy_enabled = !!this.config.rotating_proxy_enabled;
+        this.config.rotating_proxy_enabled = false;
       }
       if (process.env.ROTATING_PROXY_URL !== undefined) {
         this.config.rotating_proxy_url = process.env.ROTATING_PROXY_URL.trim();
@@ -244,24 +254,25 @@ class ConfigManager {
       }
       if (process.env.ALLOW_DIRECT_FALLBACK !== undefined) {
         this.config.allow_direct_fallback = !/^(false|0|no|off)$/i.test(String(process.env.ALLOW_DIRECT_FALLBACK).trim());
+      } else if (fileConfig.allow_direct_fallback !== undefined) {
+        this.config.allow_direct_fallback = !/^(false|0|no|off)$/i.test(String(fileConfig.allow_direct_fallback).trim());
+      } else {
+        this.config.allow_direct_fallback = false;
+      }
+      if (process.env.FREE_ONLY !== undefined) {
+        this.config.free_only = !/^(false|0|no|off)$/i.test(String(process.env.FREE_ONLY).trim());
+      } else if (fileConfig.free_only !== undefined) {
+        this.config.free_only = !/^(false|0|no|off)$/i.test(String(fileConfig.free_only).trim());
+      } else {
+        this.config.free_only = true;
       }
 
-      // 'warp_only' and other legacy modes fail closed to auto instead
+      // 'warp_only' and other legacy modes fail closed to direct instead
       // of silently falling through to a different egress policy.
-      const egressMode = String(this.config.egress_mode || 'auto').toLowerCase();
+      const egressMode = String(this.config.egress_mode || 'direct').toLowerCase();
       this.config.egress_mode = ['auto', 'proxy_only', 'direct'].includes(egressMode)
         ? egressMode
-        : 'auto';
-
-      // Auto-migrate legacy proxy_only deployments without configured proxies:
-      // If no proxies are configured and EGRESS_MODE is not in process.env,
-      // default to auto mode and allow direct fallback so initial boot is never stranded.
-      if (!process.env.EGRESS_MODE && (!this.config.proxies || this.config.proxies.length === 0)) {
-        this.config.egress_mode = 'auto';
-        if (process.env.ALLOW_DIRECT_FALLBACK === undefined) {
-          this.config.allow_direct_fallback = true;
-        }
-      }
+        : 'direct';
 
       // Retry budget: fail fast instead of spending minutes per request.
       const envRetries = process.env.MAX_RETRIES !== undefined ? parseInt(process.env.MAX_RETRIES, 10) : NaN;
@@ -284,7 +295,9 @@ class ConfigManager {
         : this.config.proxy_auto_prune_dead !== false;
       this.config.auto_proxy_discovery = process.env.AUTO_PROXY_DISCOVERY !== undefined
         ? !/^(false|0|no|off)$/i.test(String(process.env.AUTO_PROXY_DISCOVERY).trim())
-        : this.config.auto_proxy_discovery !== false;
+        : (fileConfig.auto_proxy_discovery !== undefined
+          ? !/^(false|0|no|off)$/i.test(String(fileConfig.auto_proxy_discovery).trim())
+          : false);
 
       this.config.request_timeout_ms = Math.max(
         5000,
