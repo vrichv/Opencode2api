@@ -40,10 +40,44 @@ function createToolAdapter(coreTools, definitions, choice, options = {}) {
   if (forcedName && !clientToolNames.has(forcedName)) throw protocolError('The selected tool is not declared by the client.', 400);
   const required = choice === 'required' || Boolean(forcedName);
   const disabled = !clients.length || choice === 'none';
-  const toolChoice = disabled ? 'none' : required ? { type: 'function', function: { name: 'shell' } } : choice;
+  // Models that only accept tool_choice "auto" (for example GLM) cannot use
+  // the shell tunnel: they ignore the instruction and stall when the tool they
+  // want is not declared. Send their client tools natively instead.
+  const nativeMode = options.nativeClientTools === true && clients.length > 0 && !disabled;
+  const toolChoice = disabled
+    ? 'none'
+    : nativeMode
+      ? (forcedName ? { type: 'function', function: { name: forcedName } } : 'auto')
+      : required ? { type: 'function', function: { name: 'shell' } } : choice;
+
+  function nativeToolList() {
+    const list = clients.map(tool => structuredClone(tool));
+    const taken = new Set(list.map(tool => tool.function.name));
+    for (const tool of coreTools) {
+      if (taken.has(tool.function.name)) continue;
+      list.push(structuredClone(tool));
+      taken.add(tool.function.name);
+    }
+    if (!taken.has('read')) {
+      const read = coreTools.find(tool => tool.function.name === 'read');
+      if (read) { list.push(structuredClone(read)); taken.add('read'); }
+    }
+    if (!taken.has('bash')) {
+      const shell = coreTools.find(tool => tool.function.name === 'shell');
+      if (shell) {
+        const bash = structuredClone(shell);
+        bash.function.name = 'bash';
+        bash.function.description = 'Execute a shell command and return its output.';
+        list.push(bash);
+        taken.add('bash');
+      }
+    }
+    return list;
+  }
 
   function mapMessages(messages) {
     if (!Array.isArray(messages)) return messages;
+    if (nativeMode) return messages;
     const mapped = messages.map(message => {
       let next = message;
       if (Array.isArray(message.tool_calls)) next = { ...next, tool_calls: message.tool_calls.map(encodeCall) };
@@ -218,7 +252,7 @@ function createToolAdapter(coreTools, definitions, choice, options = {}) {
   }
 
   return {
-    tools: structuredClone(coreTools),
+    tools: nativeMode ? nativeToolList() : structuredClone(coreTools),
     toolChoice,
     clientToolNames,
     injectedToolNames: new Set(coreTools.map(tool => tool.function.name)),

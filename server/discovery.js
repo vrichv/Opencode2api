@@ -245,6 +245,14 @@ class ModelDiscoveryService {
           (cleanId.includes('1m') || cleanId.includes('vl') ? 1048576 : 200000);
         const maxOutput = Math.min(positiveInteger(raw.limit?.output) || positiveInteger(meta.limit?.output) || 32000, contextWindow);
         const maxInput = Math.min(positiveInteger(raw.limit?.input) || positiveInteger(meta.limit?.input) || contextWindow, contextWindow);
+        // Provider-declared capabilities decide how reasoning and tools are
+        // shaped. Tool transport lives under the chat-completions API block;
+        // reasoning capabilities sit at the model level.
+        const apiCaps = raw.api?.['chat-completions']?.capabilities || {};
+        const modelCaps = raw.capabilities || meta.capabilities || {};
+        const toolChoiceModes = Array.isArray(apiCaps.tools?.choice) ? [...apiCaps.tools.choice] : null;
+        const reasoningEffortLevels = Array.isArray(modelCaps.reasoning?.effort) ? [...modelCaps.reasoning.effort] : null;
+        const reasoningToggle = typeof modelCaps.reasoning?.toggle === 'boolean' ? modelCaps.reasoning.toggle : null;
 
         // If this cleanId is already mapped, prioritize the -free variant
         if (modelMap.has(cleanId)) {
@@ -255,6 +263,9 @@ class ModelDiscoveryService {
             existing.context_window = contextWindow;
             existing.max_output = maxOutput;
             existing.max_input = maxInput;
+            existing.tool_choice_modes = toolChoiceModes;
+            existing.reasoning_effort_levels = reasoningEffortLevels;
+            existing.reasoning_toggle = reasoningToggle;
           }
           continue;
         }
@@ -267,6 +278,9 @@ class ModelDiscoveryService {
           context_window: contextWindow,
           max_output: maxOutput,
           max_input: maxInput,
+          tool_choice_modes: toolChoiceModes,
+          reasoning_effort_levels: reasoningEffortLevels,
+          reasoning_toggle: reasoningToggle,
           modalities: meta.modalities?.input || (cleanId.includes('vl') || cleanId.includes('flash') ? ['text', 'image'] : ['text']),
           supports_vision: (meta.modalities?.input || []).includes('image') || cleanId.includes('vl'),
           supports_reasoning: meta.reasoning !== false,

@@ -123,6 +123,36 @@ function canUseDirectFallback(attemptedRoutes = null) {
   return true;
 }
 
+
+// Providers disagree on effort vocabulary. Map the client's intent onto the
+// levels the model actually advertises instead of forwarding an invalid value.
+const EFFORT_ALIASES = { minimal: 'low', low: 'low', medium: 'high', high: 'high', xhigh: 'max', ultra: 'max', max: 'max' };
+
+function normalizeReasoningEffort(effort, levels) {
+  const wanted = EFFORT_ALIASES[String(effort || '').toLowerCase()] || String(effort || '').toLowerCase();
+  if (!wanted) return undefined;
+  if (levels.includes(wanted)) return wanted;
+  if (wanted === 'none') return undefined;
+  if (levels.includes('high')) return 'high';
+  return levels[levels.length - 1];
+}
+
+function shapeToolChoice(choice, modes) {
+  if (!Array.isArray(modes) || modes.length === 0 || choice === undefined || choice === null) return choice;
+  if (typeof choice === 'string') {
+    if (modes.includes(choice)) return choice;
+    if (choice === 'none') return undefined;
+    if (choice === 'required') return modes.includes('required') ? 'required' : 'auto';
+    return choice;
+  }
+  if (choice.type === 'function') return (modes.includes('tool') || modes.includes('required')) ? choice : 'auto';
+  return choice;
+}
+
+function supportsNativeClientTools(model) {
+  return Array.isArray(model?.tool_choice_modes) && model.tool_choice_modes.length === 1 && model.tool_choice_modes[0] === 'auto';
+}
+
 // Watchdog to disarm connection timeout once streaming begins, while guarding
 // against silent mid-stream stalls without killing active token generation.
 function attachStreamWatchdog(upstreamRes, failFn, idleTimeoutMs = 60000) {
@@ -513,16 +543,37 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
   }
 
   const officialUpstream = bunBridge.isOfficialUpstream(upstreamTarget());
+  const modelMeta = discovery.getModel(currentModel);
+  if (modelMeta?.reasoning_effort_levels?.length && reasoningEffort) {
+    reasoningEffort = normalizeReasoningEffort(reasoningEffort, modelMeta.reasoning_effort_levels);
+    if (!reasoningEffort) thinkingConfig = undefined;
+  }
+  if (modelMeta && modelMeta.reasoning_toggle === null && (reasoningEffort || thinkingConfig)) {
+    // The provider cannot disable reasoning; ask for thinking without the
+    // budget fields this family does not define.
+    thinkingConfig = { type: 'enabled' };
+  }
+  if (modelMeta?.reasoning_effort_levels?.length && thinkingConfig?.budget_tokens !== undefined) {
+    thinkingConfig = { type: thinkingConfig.type || 'enabled' };
+  }
+  const nativeClientTools = supportsNativeClientTools(modelMeta);
   const baseSanitized = sanitizeClientPayload(clientPayload);
+  // The adapter owns tool_choice; the client's copy would otherwise win when
+  // the adapter drops it (for example a provider that only accepts "auto").
+  delete baseSanitized.tool_choice;
+  // Same for reasoning controls: the shaping below is authoritative, so a
+  // dropped or normalized value must not survive from the client copy.
+  delete baseSanitized.reasoning_effort;
+  delete baseSanitized.thinking;
   // The official gate requires a system message containing the CLI's <env>
   // block. Preserve the caller's prompt and append the context when missing.
   if (isRequestedFree && officialUpstream) {
     baseSanitized.messages = upstreamContext.ensureUpstreamEnv(baseSanitized.messages);
   }
-  const toolResult = tools.mergeTools(clientPayload.tools, clientPayload.tool_choice, { parallelToolCalls: clientPayload.parallel_tool_calls });
+  const toolResult = tools.mergeTools(clientPayload.tools, clientPayload.tool_choice, { parallelToolCalls: clientPayload.parallel_tool_calls, nativeClientTools });
   baseSanitized.messages = toolResult.mapMessages(baseSanitized.messages);
   const mergedTools = toolResult.tools;
-  const mergedToolChoice = toolResult.toolChoice;
+  const mergedToolChoice = shapeToolChoice(toolResult.toolChoice, modelMeta?.tool_choice_modes);
   const clientToolNames = toolResult.clientToolNames;
 
   const maxRetries = Math.min(3, configInt('max_retries', 2));
@@ -1200,6 +1251,8 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
   }
 
   const requestedModel = rawRequestedModel || discovery.getDefaultModelId();
+  const modelMeta = discovery.getModel(requestedModel);
+  const nativeClientTools = supportsNativeClientTools(modelMeta);
 
   // 1. Translate Anthropic system & messages to OpenAI format
   let openAiMessages = [];
@@ -1288,10 +1341,10 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
   }
 
   const parallelToolCalls = clientPayload.tool_choice?.disable_parallel_tool_use === true ? false : undefined;
-  const toolResult = tools.mergeTools(clientTools, clientToolChoice, { parallelToolCalls });
+  const toolResult = tools.mergeTools(clientTools, clientToolChoice, { parallelToolCalls, nativeClientTools });
   openAiMessages = toolResult.mapMessages(openAiMessages);
   const mergedTools = toolResult.tools;
-  const mergedToolChoice = toolResult.toolChoice;
+  const mergedToolChoice = shapeToolChoice(toolResult.toolChoice, modelMeta?.tool_choice_modes);
   const clientToolNames = toolResult.clientToolNames;
 
   const isFreeOnly = config.get('free_only') !== false;
