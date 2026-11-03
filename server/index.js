@@ -14,6 +14,7 @@ const requestQueue = require('./requestQueue');
 const adminRoutes = require('./adminRoutes');
 const metrics = require('./metrics');
 const bunBridge = require('./bunBridge');
+const { publicLimits } = require('./modelLimits');
 
 // Global exception protection to guarantee gateway 100% zero-crash uptime
 process.on('uncaughtException', (err) => {
@@ -282,8 +283,7 @@ const server = http.createServer(async (req, res) => {
         object: "model",
         created: 1792240000,
         owned_by: "opencode-zen",
-        context_window: m.context_window,
-        max_output: m.max_output,
+        ...publicLimits(m),
         modalities: m.modalities,
         supports_vision: m.supports_vision,
         supports_reasoning: m.supports_reasoning,
@@ -307,7 +307,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: { message: `Model '${modelId}' not found.` } }));
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ id: model.id, object: "model", ...model }));
+      return res.end(JSON.stringify({ id: model.id, object: "model", ...model, ...publicLimits(model) }));
     }
 
     // 4. OpenAI Chat Completions (/v1/chat/completions)

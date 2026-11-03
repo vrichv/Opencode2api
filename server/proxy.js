@@ -409,10 +409,6 @@ function sanitizeClientPayload(payload) {
       cleaned[key] = payload[key];
     }
   }
-  if (cleaned.max_tokens === undefined && cleaned.max_completion_tokens !== undefined) {
-    cleaned.max_tokens = cleaned.max_completion_tokens;
-  }
-  delete cleaned.max_completion_tokens;
   return cleaned;
 }
 
@@ -635,7 +631,20 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
     const sessionId = identity.generateCanonicalSessionId();
     const projectId = identity.generateProjectId();
 
-    // Admission control: bound concurrent upstream requests per gateway and per API key.
+    const upstreamPayload = {
+      ...baseSanitized,
+      model: upstreamModel,
+      stream: true,
+      tools: mergedTools,
+      ...(mergedToolChoice !== undefined ? { tool_choice: mergedToolChoice } : {}),
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+      ...(thinkingConfig ? { thinking: thinkingConfig } : {})
+    };
+
+    const payloadString = JSON.stringify(upstreamPayload);
+    const payloadBytes = Buffer.byteLength(payloadString);
+    const upstreamHeaders = identity.buildUpstreamHeaders(sessionId, projectId, payloadBytes);
+
     const releaseSlot = await requestQueue.acquire(keyObj?.id || 'anonymous', Math.min(queueWaitMs, remainingMs));
     if (!releaseSlot) {
       metrics.recordRequest({
@@ -652,18 +661,6 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
       return;
     }
 
-    const upstreamPayload = {
-      ...baseSanitized,
-      model: upstreamModel,
-      stream: true,
-      tools: mergedTools,
-      ...(mergedToolChoice !== undefined ? { tool_choice: mergedToolChoice } : {}),
-      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-      ...(thinkingConfig ? { thinking: thinkingConfig } : {})
-    };
-
-    const payloadString = JSON.stringify(upstreamPayload);
-    const upstreamHeaders = identity.buildUpstreamHeaders(sessionId, projectId, Buffer.byteLength(payloadString));
     const isProxyRoute = activeRoute.type === 'proxy';
     const proxyAttemptTimeout = activeRoute.isRotating
       ? configInt('rotating_proxy_timeout_ms', 5000, 2000)
@@ -716,7 +713,7 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
             let errBody = '';
             upstreamRes.on('data', chunk => errBody += chunk.toString());
             upstreamRes.on('end', () => {
-              console.warn(`[Proxy] Upstream ${upstreamRes.statusCode} error body for ${currentModel} (${routeLabel(activeRoute)}) [CT: ${contentType}]: ${errBody.slice(0, 300)}`);
+              console.warn(`[Proxy] Upstream ${upstreamRes.statusCode} error body for ${currentModel} (${routeLabel(activeRoute)}) [CT: ${contentType}; request_bytes: ${payloadBytes}; output_tokens: ${upstreamPayload.max_completion_tokens ?? upstreamPayload.max_tokens ?? "unset"}]: ${errBody.slice(0, 300)}`);
               if (!isValidContentType) {
                 try { upstreamReq.destroy(); } catch (e) {}
                 if (upstreamRes.socket) {
@@ -1467,6 +1464,22 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
     const sessionId = identity.generateCanonicalSessionId();
     const projectId = identity.generateProjectId();
 
+    const upstreamPayload = {
+      model: upstreamModel,
+      messages: openAiMessages,
+      stream: true,
+      tools: mergedTools,
+      ...(mergedToolChoice !== undefined ? { tool_choice: mergedToolChoice } : {}),
+      ...(parallelToolCalls !== undefined ? { parallel_tool_calls: parallelToolCalls } : {}),
+      ...(clientPayload.temperature !== undefined ? { temperature: clientPayload.temperature } : {}),
+      ...(clientPayload.top_p !== undefined ? { top_p: clientPayload.top_p } : {}),
+      ...(clientPayload.max_tokens ? { max_tokens: clientPayload.max_tokens } : {})
+    };
+
+    const payloadString = JSON.stringify(upstreamPayload);
+    const payloadBytes = Buffer.byteLength(payloadString);
+    const upstreamHeaders = identity.buildUpstreamHeaders(sessionId, projectId, payloadBytes);
+
     const releaseSlot = await requestQueue.acquire(keyObj?.id || 'anonymous', Math.min(queueWaitMs, remainingMs));
     if (!releaseSlot) {
       metrics.recordRequest({
@@ -1483,20 +1496,6 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
       return;
     }
 
-    const upstreamPayload = {
-      model: upstreamModel,
-      messages: openAiMessages,
-      stream: true,
-      tools: mergedTools,
-      ...(mergedToolChoice !== undefined ? { tool_choice: mergedToolChoice } : {}),
-      ...(parallelToolCalls !== undefined ? { parallel_tool_calls: parallelToolCalls } : {}),
-      ...(clientPayload.temperature !== undefined ? { temperature: clientPayload.temperature } : {}),
-      ...(clientPayload.top_p !== undefined ? { top_p: clientPayload.top_p } : {}),
-      ...(clientPayload.max_tokens ? { max_tokens: clientPayload.max_tokens } : {})
-    };
-
-    const payloadString = JSON.stringify(upstreamPayload);
-    const upstreamHeaders = identity.buildUpstreamHeaders(sessionId, projectId, Buffer.byteLength(payloadString));
     const isProxyRoute = activeRoute.type === 'proxy';
     const proxyAttemptTimeout = activeRoute.isRotating
       ? configInt('rotating_proxy_timeout_ms', 5000, 2000)
@@ -1548,7 +1547,7 @@ async function handleAnthropicMessages(clientPayload, req, res, keyObj) {
             let errBody = '';
             upstreamRes.on('data', chunk => errBody += chunk.toString());
             upstreamRes.on('end', () => {
-              console.warn(`[Proxy] Upstream ${upstreamRes.statusCode} error body for Anthropic model ${currentModel} (${routeLabel(activeRoute)}) [CT: ${contentType}]: ${errBody.slice(0, 300)}`);
+              console.warn(`[Proxy] Upstream ${upstreamRes.statusCode} error body for Anthropic model ${currentModel} (${routeLabel(activeRoute)}) [CT: ${contentType}; request_bytes: ${payloadBytes}; output_tokens: ${upstreamPayload.max_completion_tokens ?? upstreamPayload.max_tokens ?? "unset"}]: ${errBody.slice(0, 300)}`);
               if (!isValidContentType) {
                 try { upstreamReq.destroy(); } catch (e) {}
                 if (upstreamRes.socket) {

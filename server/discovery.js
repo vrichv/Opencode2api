@@ -4,6 +4,7 @@ const path = require('path');
 const config = require('./config');
 const notifications = require('./notifications');
 const egress = require('./egress');
+const { positiveInteger } = require('./modelLimits');
 
 const MODELS_CACHE_FILE = path.join(__dirname, '..', 'data', 'models.json');
 
@@ -202,10 +203,11 @@ class ModelDiscoveryService {
         for (const [provKey, provVal] of Object.entries(catalog)) {
           if (provVal && provVal.models) {
             for (const [mId, mVal] of Object.entries(provVal.models)) {
-              metaMap[mId] = mVal;
+              if (metaMap[mId] === undefined || provKey === 'opencode') metaMap[mId] = mVal;
               const slashIdx = mId.lastIndexOf('/');
               if (slashIdx !== -1) {
-                metaMap[mId.slice(slashIdx + 1)] = mVal;
+                const shortId = mId.slice(slashIdx + 1);
+                if (metaMap[shortId] === undefined || provKey === 'opencode') metaMap[shortId] = mVal;
               }
             }
           }
@@ -239,6 +241,10 @@ class ModelDiscoveryService {
 
         const cleanId = isFree ? cleanModelId(rawId) : rawId;
         const actualUpstream = rawId; // Exactly match Zen upstream ID!
+        const contextWindow = positiveInteger(raw.limit?.context) || positiveInteger(meta.limit?.context) ||
+          (cleanId.includes('1m') || cleanId.includes('vl') ? 1048576 : 200000);
+        const maxOutput = Math.min(positiveInteger(raw.limit?.output) || positiveInteger(meta.limit?.output) || 32000, contextWindow);
+        const maxInput = Math.min(positiveInteger(raw.limit?.input) || positiveInteger(meta.limit?.input) || contextWindow, contextWindow);
 
         // If this cleanId is already mapped, prioritize the -free variant
         if (modelMap.has(cleanId)) {
@@ -246,6 +252,9 @@ class ModelDiscoveryService {
           if (isFree && !existing.is_free) {
             existing.upstream_id = actualUpstream;
             existing.is_free = true;
+            existing.context_window = contextWindow;
+            existing.max_output = maxOutput;
+            existing.max_input = maxInput;
           }
           continue;
         }
@@ -255,8 +264,9 @@ class ModelDiscoveryService {
           upstream_id: actualUpstream,
           name: meta.name || cleanId,
           description: meta.description || (isFree ? 'OpenCode Zen High-Performance Free Model' : 'OpenCode Zen Enterprise Model (Zen Key required)'),
-          context_window: meta.limit?.context || (cleanId.includes('1m') || cleanId.includes('vl') ? 1048576 : 200000),
-          max_output: meta.limit?.output || 32000,
+          context_window: contextWindow,
+          max_output: maxOutput,
+          max_input: maxInput,
           modalities: meta.modalities?.input || (cleanId.includes('vl') || cleanId.includes('flash') ? ['text', 'image'] : ['text']),
           supports_vision: (meta.modalities?.input || []).includes('image') || cleanId.includes('vl'),
           supports_reasoning: meta.reasoning !== false,

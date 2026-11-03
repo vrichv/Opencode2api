@@ -177,7 +177,18 @@ function classifyUpstreamFailure(statusCode, body) {
   const text = typeof body === 'string' ? body : JSON.stringify(body || '');
   const code = Number(statusCode) || 0;
 
-  if (code === 429) return 'quota';
+  if (code === 429) {
+    // Some compatible providers use 429 even for a per-request context error.
+    // Preserve explicit context codes so clients can compact; do not infer an
+    // overflow from the generic FreeUsageLimitError or from token estimates.
+    try {
+      const payload = JSON.parse(text);
+      const detail = payload.error || payload;
+      if ([detail.code, detail.type].some(value =>
+        /^(context_length_exceeded|max_context_length_exceeded|context_window_exceeded|prompt_too_long|input_too_long)$/i.test(String(value)))) return 'fatal';
+    } catch (e) {}
+    return 'quota';
+  }
   if (code === 403 && /(freeusage|freetier|capacity|rate.?limit|quota|too many)/i.test(text)) {
     return 'quota';
   }
