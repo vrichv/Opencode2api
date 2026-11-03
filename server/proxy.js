@@ -129,10 +129,13 @@ function canUseDirectFallback(attemptedRoutes = null) {
 const EFFORT_ALIASES = { minimal: 'low', low: 'low', medium: 'high', high: 'high', xhigh: 'max', ultra: 'max', max: 'max' };
 
 function normalizeReasoningEffort(effort, levels) {
-  const wanted = EFFORT_ALIASES[String(effort || '').toLowerCase()] || String(effort || '').toLowerCase();
-  if (!wanted) return undefined;
+  const raw = String(effort || '').toLowerCase();
+  if (!raw) return undefined;
+  // Keep the value when the model advertises it; only translate otherwise.
+  if (levels.includes(raw)) return raw;
+  if (raw === 'none') return undefined;
+  const wanted = EFFORT_ALIASES[raw] || raw;
   if (levels.includes(wanted)) return wanted;
-  if (wanted === 'none') return undefined;
   if (levels.includes('high')) return 'high';
   return levels[levels.length - 1];
 }
@@ -547,11 +550,6 @@ async function handleChatCompletions(clientPayload, req, res, keyObj) {
   if (modelMeta?.reasoning_effort_levels?.length && reasoningEffort) {
     reasoningEffort = normalizeReasoningEffort(reasoningEffort, modelMeta.reasoning_effort_levels);
     if (!reasoningEffort) thinkingConfig = undefined;
-  }
-  if (modelMeta && modelMeta.reasoning_toggle === null && (reasoningEffort || thinkingConfig)) {
-    // The provider cannot disable reasoning; ask for thinking without the
-    // budget fields this family does not define.
-    thinkingConfig = { type: 'enabled' };
   }
   if (modelMeta?.reasoning_effort_levels?.length && thinkingConfig?.budget_tokens !== undefined) {
     thinkingConfig = { type: thinkingConfig.type || 'enabled' };

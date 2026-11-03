@@ -62,16 +62,6 @@ function createToolAdapter(coreTools, definitions, choice, options = {}) {
       const read = coreTools.find(tool => tool.function.name === 'read');
       if (read) { list.push(structuredClone(read)); taken.add('read'); }
     }
-    if (!taken.has('bash')) {
-      const shell = coreTools.find(tool => tool.function.name === 'shell');
-      if (shell) {
-        const bash = structuredClone(shell);
-        bash.function.name = 'bash';
-        bash.function.description = 'Execute a shell command and return its output.';
-        list.push(bash);
-        taken.add('bash');
-      }
-    }
     return list;
   }
 
